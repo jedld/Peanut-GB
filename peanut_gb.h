@@ -47,6 +47,12 @@
 #include <string.h>	/* Required for memset */
 #include <time.h>	/* Required for tm struct */
 
+#if defined(ESP_PLATFORM)
+#include <esp_attr.h>
+#endif
+
+#include "../mbc7.h"
+
 /**
 * If PEANUT_GB_IS_LITTLE_ENDIAN is positive, then Peanut-GB will be configured
 * for a little endian platform. If 0, then big endian.
@@ -105,6 +111,42 @@
 # define PEANUT_GB_USE_INTRINSICS 1
 #endif
 
+/* Hint hot paths to land in IRAM on ESP32-family targets. */
+#if !defined(PEANUT_GB_HOT_ATTR)
+# if defined(ESP_PLATFORM)
+#  define PEANUT_GB_HOT_ATTR IRAM_ATTR
+# else
+#  define PEANUT_GB_HOT_ATTR
+# endif
+#endif
+
+#if !defined(PEANUT_GB_LIKELY)
+# if defined(__GNUC__) || defined(__clang__)
+#  define PEANUT_GB_LIKELY(x) __builtin_expect(!!(x), 1)
+#  define PEANUT_GB_UNLIKELY(x) __builtin_expect(!!(x), 0)
+# else
+#  define PEANUT_GB_LIKELY(x) (x)
+#  define PEANUT_GB_UNLIKELY(x) (x)
+# endif
+#endif
+
+#if !defined(PEANUT_GB_FAST_DATA_ATTR)
+# if defined(ESP_PLATFORM)
+#  define PEANUT_GB_FAST_DATA_ATTR DRAM_ATTR
+# else
+#  define PEANUT_GB_FAST_DATA_ATTR
+# endif
+#endif
+
+/* Enable instruction tracing ring buffer. Disable to reduce per-instruction overhead. */
+#ifndef PEANUT_GB_ENABLE_TRACE
+# if defined(ESP_PLATFORM)
+#  define PEANUT_GB_ENABLE_TRACE 0
+# else
+#  define PEANUT_GB_ENABLE_TRACE 1
+# endif
+#endif
+
 /* Only include function prototypes. At least one file must *not* have this
  * defined. */
 // #define PEANUT_GB_HEADER_ONLY
@@ -120,7 +162,9 @@
 
 /* Memory section sizes for DMG */
 #define WRAM_SIZE	0x2000
+#define WRAM_TOTAL_SIZE	(WRAM_BANK_SIZE * 8)
 #define VRAM_SIZE	0x2000
+#define VRAM_TOTAL_SIZE	(VRAM_SIZE * 2)
 #define HRAM_IO_SIZE	0x0100
 #define OAM_SIZE	0x00A0
 
@@ -248,6 +292,7 @@
 #define JOYPAD_DOWN         0x80
 
 #define ROM_HEADER_CHECKSUM_LOC	0x014D
+#define ROM_CGB_FLAG_LOC	0x0143
 
 /* Local macros. */
 #ifndef MIN
@@ -542,6 +587,7 @@ enum gb_init_error_e
 {
 	GB_INIT_NO_ERROR = 0,
 	GB_INIT_CARTRIDGE_UNSUPPORTED,
+	GB_INIT_OUT_OF_MEMORY,
 	GB_INIT_INVALID_CHECKSUM,
 
 	GB_INIT_INVALID_MAX
@@ -554,6 +600,38 @@ enum gb_serial_rx_ret_e
 {
 	GB_SERIAL_RX_SUCCESS = 0,
 	GB_SERIAL_RX_NO_CONNECTION = 1
+};
+
+#define GB_DEBUG_TRACE_DEPTH 64
+
+struct gb_trace_entry
+{
+	uint16_t pc;
+	uint8_t opcode;
+	uint8_t operand1;
+	uint8_t operand2;
+	uint8_t a;
+	uint8_t f;
+	uint8_t b;
+	uint8_t c;
+	uint8_t d;
+	uint8_t e;
+	uint8_t h;
+	uint8_t l;
+	uint16_t sp;
+	uint8_t ime;
+	uint8_t if_reg;
+	uint8_t ie;
+	uint8_t stat;
+	uint8_t lcdc;
+	uint8_t ly;
+};
+
+struct gb_trace_state
+{
+	struct gb_trace_entry entries[GB_DEBUG_TRACE_DEPTH];
+	uint8_t head;
+	uint8_t count;
 };
 
 union cart_rtc
@@ -621,6 +699,9 @@ struct gb_s
 	/* Read byte from boot ROM at given address. */
 	uint8_t (*gb_bootrom_read)(struct gb_s*, const uint_fast16_t addr);
 
+	/* MBC7 accelerometer read callback. */
+	mbc7_accel_read_t mbc7_accel_read;
+
 	struct
 	{
 		bool gb_halt	: 1;
@@ -652,17 +733,39 @@ struct gb_s
 	/* Cartridge ROM/RAM mode select. */
 	uint8_t cart_mode_select;
 
+	/* MBC7 state */
+	struct mbc7_s mbc7;
+
 	union cart_rtc rtc_latched, rtc_real;
 
 	struct cpu_registers_s cpu_reg;
 	//struct gb_registers_s gb_reg;
 	struct count_s counter;
+	struct gb_trace_state trace;
 
 	/* TODO: Allow implementation to allocate WRAM, VRAM and Frame Buffer. */
-	uint8_t wram[WRAM_SIZE];
-	uint8_t vram[VRAM_SIZE];
-	uint8_t oam[OAM_SIZE];
-	uint8_t hram_io[HRAM_IO_SIZE];
+	uint8_t *wram;
+	uint8_t *vram;
+	uint8_t *oam;
+	uint8_t *hram_io;
+
+	struct {
+		uint8_t enabled;
+		uint8_t vram_bank;
+		uint8_t wram_bank;
+		uint8_t key1;
+		uint8_t speed_double;
+		uint8_t bg_palette_index;
+		uint8_t obj_palette_index;
+		uint8_t bg_palette_autoinc;
+		uint8_t obj_palette_autoinc;
+		uint8_t hdma_active;
+		uint16_t hdma_source;
+		uint16_t hdma_dest;
+		uint16_t hdma_remaining;
+		uint8_t bg_palette_data[64];
+		uint8_t obj_palette_data[64];
+	} cgb;
 
 	struct
 	{
@@ -692,9 +795,25 @@ struct gb_s
 		/* Palettes */
 		uint8_t bg_palette[4];
 		uint8_t sp_palette[8];
+		uint32_t cgb_bg_palette[32];
+		uint32_t cgb_obj_palette[32];
+		uint32_t cgb_line[LCD_WIDTH];
+		uint8_t cgb_bg_priority[LCD_WIDTH];
+		uint8_t cgb_bg_color_zero[LCD_WIDTH];
 
 		uint8_t window_clear;
 		uint8_t WY;
+
+		struct
+		{
+			uint8_t hold_frames;
+			uint8_t minimum_active_frames;
+			uint8_t debounce_frames_remaining;
+			uint8_t frames_since_toggle;
+			uint8_t over_budget_streak;
+			uint8_t under_budget_streak;
+			uint8_t current_frame_skip;
+		} frame_skip_state;
 
 		/* Only support 30fps frame skip. */
 		bool frame_skip_count : 1;
@@ -764,6 +883,19 @@ struct gb_s
 #define IO_WY	0x4A
 #define IO_WX	0x4B
 #define IO_BOOT	0x50
+#define IO_BANK	IO_BOOT /* Boot ROM disable register (FF50) */
+#define IO_KEY1	0x4D
+#define IO_VBK	0x4F
+#define IO_HDMA1	0x51
+#define IO_HDMA2	0x52
+#define IO_HDMA3	0x53
+#define IO_HDMA4	0x54
+#define IO_HDMA5	0x55
+#define IO_BCPS	0x68
+#define IO_BCPD	0x69
+#define IO_OCPS	0x6A
+#define IO_OCPD	0x6B
+#define IO_SVBK	0x70
 #define IO_IE	0xFF
 
 #define IO_TAC_RATE_MASK	0x3
@@ -780,7 +912,143 @@ struct gb_s
  * Internal function used to read bytes.
  * addr is host platform endian.
  */
-uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
+PEANUT_GB_HOT_ATTR uint8_t __gb_read(struct gb_s *gb, uint16_t addr);
+
+static inline uint8_t *gb_wram_ptr(struct gb_s *gb, uint16_t addr)
+{
+	if(addr < WRAM_1_ADDR)
+		return &gb->wram[addr - WRAM_0_ADDR];
+
+	uint8_t bank = gb->cgb.enabled ? (gb->cgb.wram_bank & 0x07) : 1;
+	if(bank == 0)
+		bank = 1;
+
+	return &gb->wram[bank * WRAM_BANK_SIZE + (addr - WRAM_1_ADDR)];
+}
+
+static inline uint16_t gb_map_echo_address(uint16_t addr)
+{
+	return (addr - ECHO_ADDR) + WRAM_0_ADDR;
+}
+
+static inline uint32_t gb_colour_555_to_rgb888(uint16_t colour)
+{
+	colour &= 0x7FFF;
+	uint8_t r = (colour & 0x1F) << 3;
+	uint8_t g = ((colour >> 5) & 0x1F) << 3;
+	uint8_t b = ((colour >> 10) & 0x1F) << 3;
+	r |= r >> 5;
+	g |= g >> 5;
+	b |= b >> 5;
+	return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+static inline uint8_t gb_reverse_byte(uint8_t value)
+{
+	value = (value >> 4) | (value << 4);
+	value = ((value & 0xCC) >> 2) | ((value & 0x33) << 2);
+	value = ((value & 0xAA) >> 1) | ((value & 0x55) << 1);
+	return value;
+}
+
+static inline void gb_cgb_update_palette_entry(struct gb_s *gb, uint8_t index, uint8_t is_obj)
+{
+	const uint8_t entry = (index & 0x3E) >> 1;
+	const uint8_t *data = is_obj ? gb->cgb.obj_palette_data : gb->cgb.bg_palette_data;
+	const uint8_t lo = data[entry * 2];
+	const uint8_t hi = data[entry * 2 + 1];
+	const uint16_t raw = ((uint16_t)hi << 8) | lo;
+	uint32_t colour = gb_colour_555_to_rgb888(raw);
+	if(is_obj)
+		gb->display.cgb_obj_palette[entry] = colour;
+	else
+		gb->display.cgb_bg_palette[entry] = colour;
+}
+
+static inline void gb_cgb_dma_transfer_chunk(struct gb_s *gb, uint16_t length)
+{
+	uint16_t source = gb->cgb.hdma_source & 0xFFF0;
+	uint16_t dest = (gb->cgb.hdma_dest & 0x1FF0) | 0x8000;
+	uint8_t vram_bank = gb->cgb.vram_bank & 0x01;
+
+	for(uint16_t i = 0; i < length; i++)
+	{
+		uint16_t src_addr = source + i;
+		uint16_t dst_addr = dest + i;
+		if(dst_addr < 0x8000 || dst_addr >= 0xA000)
+			break;
+		uint8_t value = __gb_read(gb, src_addr);
+		uint16_t offset = dst_addr - VRAM_ADDR;
+		if(offset < VRAM_SIZE)
+			gb->vram[vram_bank * VRAM_SIZE + offset] = value;
+	}
+
+	gb->cgb.hdma_source = (source + length) & 0xFFF0;
+	gb->cgb.hdma_dest = 0x8000 | (((dest - VRAM_ADDR + length) & 0x1FF0));
+}
+
+static inline void gb_cgb_hblank_dma_step(struct gb_s *gb)
+{
+	if(!gb->cgb.hdma_active || gb->cgb.hdma_remaining == 0)
+		return;
+
+	uint16_t chunk = gb->cgb.hdma_remaining >= 0x10 ? 0x10 : gb->cgb.hdma_remaining;
+	gb_cgb_dma_transfer_chunk(gb, chunk);
+
+	gb->cgb.hdma_remaining -= chunk;
+	if(gb->cgb.hdma_remaining == 0)
+	{
+		gb->cgb.hdma_active = 0;
+		gb->hram_io[IO_HDMA5] = 0xFF;
+	}
+	else
+	{
+		uint8_t blocks_remaining = 0;
+		if(gb->cgb.hdma_remaining >= 0x10)
+			blocks_remaining = (uint8_t)((gb->cgb.hdma_remaining / 0x10) - 1);
+		gb->hram_io[IO_HDMA5] = 0x80 | (blocks_remaining & 0x7F);
+	}
+}
+
+static inline void gb_trace_push(struct gb_s *gb, uint16_t pc, uint8_t opcode)
+{
+#if PEANUT_GB_ENABLE_TRACE
+	struct gb_trace_state *trace = &gb->trace;
+	struct gb_trace_entry *entry = &trace->entries[trace->head];
+	entry->pc = pc;
+	entry->opcode = opcode;
+	entry->operand1 = __gb_read(gb, (uint16_t)(pc + 1));
+	entry->operand2 = __gb_read(gb, (uint16_t)(pc + 2));
+	entry->a = gb->cpu_reg.a;
+	entry->f = gb->cpu_reg.f.reg;
+	entry->b = gb->cpu_reg.bc.bytes.b;
+	entry->c = gb->cpu_reg.bc.bytes.c;
+	entry->d = gb->cpu_reg.de.bytes.d;
+	entry->e = gb->cpu_reg.de.bytes.e;
+	entry->h = gb->cpu_reg.hl.bytes.h;
+	entry->l = gb->cpu_reg.hl.bytes.l;
+	entry->sp = gb->cpu_reg.sp.reg;
+	entry->ime = gb->gb_ime;
+	entry->if_reg = gb->hram_io[IO_IF];
+	entry->ie = gb->hram_io[IO_IE];
+	entry->stat = gb->hram_io[IO_STAT];
+	entry->lcdc = gb->hram_io[IO_LCDC];
+	entry->ly = gb->hram_io[IO_LY];
+
+	trace->head++;
+	if(trace->head >= GB_DEBUG_TRACE_DEPTH)
+		trace->head = 0;
+
+	if(trace->count < GB_DEBUG_TRACE_DEPTH)
+		trace->count++;
+#else
+	(void)gb;
+	(void)pc;
+	(void)opcode;
+#endif
+}
+
+PEANUT_GB_HOT_ATTR uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 {
 	switch(PEANUT_GB_GET_MSN16(addr))
 	{
@@ -810,11 +1078,50 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 
 	case 0x8:
 	case 0x9:
-		return gb->vram[addr - VRAM_ADDR];
+	{
+		uint16_t offset = addr - VRAM_ADDR;
+		if(gb->cgb.enabled)
+			return gb->vram[(gb->cgb.vram_bank & 0x01) * VRAM_SIZE + offset];
+		return gb->vram[offset];
+	}
 
 	case 0xA:
 	case 0xB:
-		if(gb->mbc == 3 && gb->cart_ram_bank >= 0x08)
+		if(gb->mbc == 7)
+		{
+			/* MBC7 RAM/IO registers */
+			if(gb->mbc7.ram_enable_1 == 0x0A && gb->mbc7.ram_enable_2 == 0x40)
+			{
+				uint8_t reg = (addr >> 4) & 0x0F;
+				switch(reg)
+				{
+				case 0x0:
+				case 0x1:
+					return 0xFF; /* Write-only erase/latch */
+				case 0x2:
+					return gb->mbc7.accel.x & 0xFF;
+				case 0x3:
+					return (gb->mbc7.accel.x >> 8) & 0xFF;
+				case 0x4:
+					return gb->mbc7.accel.y & 0xFF;
+				case 0x5:
+					return (gb->mbc7.accel.y >> 8) & 0xFF;
+				case 0x6:
+					return 0x00;
+				case 0x7:
+					return 0xFF;
+				case 0x8:
+									   return (uint8_t)((gb->mbc7.eeprom.cs << 7) |
+															   (gb->mbc7.eeprom.clk << 6) |
+															   (gb->mbc7.eeprom.di << 1) |
+																mbc7_eeprom_poll_do(&gb->mbc7.eeprom));
+				default:
+					return 0xFF;
+				}
+			}
+			return 0xFF;
+		}
+		else if(gb->mbc == 3 && gb->cart_ram_bank >= 0x08)
 		{
 			return gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08];
 		}
@@ -840,10 +1147,13 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 
 	case 0xC:
 	case 0xD:
-		return gb->wram[addr - WRAM_0_ADDR];
+		return *gb_wram_ptr(gb, addr);
 
 	case 0xE:
-		return gb->wram[addr - ECHO_ADDR];
+	{
+		uint16_t mapped = gb_map_echo_address(addr);
+		return *gb_wram_ptr(gb, mapped);
+	}
 
 	case 0xF:
 		if(addr < OAM_ADDR)
@@ -878,7 +1188,42 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 
 		/* HRAM */
 		if(addr >= IO_ADDR)
-			return gb->hram_io[addr - IO_ADDR];
+		{
+			const uint16_t reg = addr - IO_ADDR;
+			if(gb->cgb.enabled)
+			{
+				switch(reg)
+				{
+				case IO_KEY1:
+					return (gb->cgb.speed_double ? 0x80 : 0x00) | 0x7E | (gb->cgb.key1 & 0x01);
+				case IO_VBK:
+					return 0xFE | (gb->cgb.vram_bank & 0x01);
+				case IO_SVBK:
+					return 0xF8 | (gb->cgb.wram_bank & 0x07);
+				case IO_BCPS:
+					return (gb->cgb.bg_palette_index & 0x3F) | (gb->cgb.bg_palette_autoinc ? 0x80 : 0x00);
+				case IO_OCPS:
+					return (gb->cgb.obj_palette_index & 0x3F) | (gb->cgb.obj_palette_autoinc ? 0x80 : 0x00);
+				case IO_BCPD:
+					return gb->cgb.bg_palette_data[gb->cgb.bg_palette_index & 0x3F];
+				case IO_OCPD:
+					return gb->cgb.obj_palette_data[gb->cgb.obj_palette_index & 0x3F];
+				case IO_HDMA1:
+					return gb->cgb.hdma_source >> 8;
+				case IO_HDMA2:
+					return gb->cgb.hdma_source & 0xFF;
+				case IO_HDMA3:
+					return gb->cgb.hdma_dest >> 8;
+				case IO_HDMA4:
+					return gb->cgb.hdma_dest & 0xFF;
+				case IO_HDMA5:
+					return gb->cgb.hdma_active ? (0x80 | ((gb->cgb.hdma_remaining / 0x10) - 1)) : 0xFF;
+				default:
+					break;
+				}
+			}
+			return gb->hram_io[reg];
+		}
 	}
 
 
@@ -890,12 +1235,17 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 /**
  * Internal function used to write bytes.
  */
-void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
+PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 {
 	switch(PEANUT_GB_GET_MSN16(addr))
 	{
 	case 0x0:
 	case 0x1:
+		if(gb->mbc == 7)
+		{
+			gb->mbc7.ram_enable_1 = (val == 0x0A) ? 0x0A : 0x00;
+			return;
+		}
 		/* Set RAM enable bit. MBC2 is handled in fall-through. */
 		if(gb->mbc > 0 && gb->mbc != 2 && gb->cart_ram)
 		{
@@ -905,6 +1255,14 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 	/* Intentional fall through. */
 	case 0x2:
+		if(gb->mbc == 7)
+		{
+			gb->selected_rom_bank = val & 0x7F;
+			if(!gb->selected_rom_bank)
+				gb->selected_rom_bank = 1;
+			gb->selected_rom_bank &= gb->num_rom_banks_mask;
+			return;
+		}
 		if(gb->mbc == 5)
 		{
 			gb->selected_rom_bank = (gb->selected_rom_bank & 0x100) | val;
@@ -957,6 +1315,11 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 	case 0x4:
 	case 0x5:
+		if(gb->mbc == 7)
+		{
+			gb->mbc7.ram_enable_2 = (val == 0x40) ? 0x40 : 0x00;
+			return;
+		}
 		if(gb->mbc == 1)
 		{
 			gb->cart_ram_bank = (val & 3);
@@ -990,11 +1353,47 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 	case 0x8:
 	case 0x9:
-		gb->vram[addr - VRAM_ADDR] = val;
+	{
+		uint16_t offset = addr - VRAM_ADDR;
+		if(gb->cgb.enabled)
+			gb->vram[(gb->cgb.vram_bank & 0x01) * VRAM_SIZE + offset] = val;
+		else
+			gb->vram[offset] = val;
 		return;
+	}
 
 	case 0xA:
 	case 0xB:
+		if(gb->mbc == 7)
+		{
+			if(gb->mbc7.ram_enable_1 == 0x0A && gb->mbc7.ram_enable_2 == 0x40)
+			{
+				uint8_t reg = (addr >> 4) & 0x0F;
+				switch(reg)
+				{
+				case 0x0:
+					if(val == 0x55)
+					{
+						gb->mbc7.accel.latched = 0;
+						gb->mbc7.accel.x = MBC7_ACCEL_CENTER;
+						gb->mbc7.accel.y = MBC7_ACCEL_CENTER;
+					}
+					break;
+				case 0x1:
+					if(val == 0xAA && !gb->mbc7.accel.latched)
+					{
+						mbc7_accel_latch(&gb->mbc7, gb->mbc7_accel_read, gb);
+					}
+					break;
+				case 0x8:
+					mbc7_eeprom_update(&gb->mbc7.eeprom, val);
+					break;
+				default:
+					break;
+				}
+			}
+			return;
+		}
 		if(gb->mbc == 3 && gb->cart_ram_bank >= 0x08)
 		{
 			const uint8_t rtc_reg_mask[5] = {
@@ -1034,21 +1433,25 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 		return;
 
 	case 0xC:
-		gb->wram[addr - WRAM_0_ADDR] = val;
+		*gb_wram_ptr(gb, addr) = val;
 		return;
 
 	case 0xD:
-		gb->wram[addr - WRAM_1_ADDR + WRAM_BANK_SIZE] = val;
+		*gb_wram_ptr(gb, addr) = val;
 		return;
 
 	case 0xE:
-		gb->wram[addr - ECHO_ADDR] = val;
+	{
+		uint16_t mapped = gb_map_echo_address(addr);
+		*gb_wram_ptr(gb, mapped) = val;
 		return;
+	}
 
 	case 0xF:
 		if(addr < OAM_ADDR)
 		{
-			gb->wram[addr - ECHO_ADDR] = val;
+			uint16_t mapped = gb_map_echo_address(addr);
+			*gb_wram_ptr(gb, mapped) = val;
 			return;
 		}
 
@@ -1232,6 +1635,153 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 		case 0x4B:
 			gb->hram_io[IO_WX] = val;
+			return;
+
+		case 0x4D:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.key1 = val & 0x01;
+				gb->hram_io[IO_KEY1] = (gb->cgb.speed_double ? 0x80 : 0x00) | 0x7E | gb->cgb.key1;
+			}
+			return;
+
+		case 0x4F:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.vram_bank = val & 0x01;
+				gb->hram_io[IO_VBK] = 0xFE | gb->cgb.vram_bank;
+			}
+			return;
+
+		case 0x51:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.hdma_source = (gb->cgb.hdma_source & 0x00FF) | ((uint16_t)val << 8);
+				gb->hram_io[IO_HDMA1] = val;
+			}
+			return;
+
+		case 0x52:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.hdma_source = (gb->cgb.hdma_source & 0xFF00) | (val & 0xF0);
+				gb->hram_io[IO_HDMA2] = val & 0xF0;
+			}
+			return;
+
+		case 0x53:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.hdma_dest = 0x8000 | (((uint16_t)val & 0x1F) << 8) | (gb->cgb.hdma_dest & 0x00F0);
+				gb->hram_io[IO_HDMA3] = val;
+			}
+			return;
+
+		case 0x54:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.hdma_dest = (gb->cgb.hdma_dest & 0xFF00) | (val & 0xF0);
+				gb->hram_io[IO_HDMA4] = val & 0xF0;
+			}
+			return;
+
+		case 0x55:
+			if(gb->cgb.enabled)
+			{
+				uint16_t length = (uint16_t)(((val & 0x7F) + 1u) * 0x10u);
+				if(val & 0x80)
+				{
+					gb->cgb.hdma_active = 1;
+					gb->cgb.hdma_remaining = length;
+					uint8_t blocks_remaining = (uint8_t)((gb->cgb.hdma_remaining / 0x10) - 1);
+					gb->hram_io[IO_HDMA5] = 0x80 | (blocks_remaining & 0x7F);
+					if(!(gb->hram_io[IO_LCDC] & LCDC_ENABLE) ||
+					   (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_VBLANK)
+					{
+						while(gb->cgb.hdma_active)
+							gb_cgb_hblank_dma_step(gb);
+					}
+					else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_HBLANK &&
+					        gb->hram_io[IO_LY] < LCD_HEIGHT)
+					{
+						gb_cgb_hblank_dma_step(gb);
+					}
+				}
+				else
+				{
+					if(gb->cgb.hdma_active)
+					{
+						gb->cgb.hdma_active = 0;
+						gb->cgb.hdma_remaining = 0;
+						gb->hram_io[IO_HDMA5] = 0xFF;
+					}
+					else
+					{
+						uint16_t remaining = length;
+						while(remaining)
+						{
+							uint16_t chunk = remaining > 0x10 ? 0x10 : remaining;
+							gb_cgb_dma_transfer_chunk(gb, chunk);
+							remaining -= chunk;
+						}
+						gb->cgb.hdma_active = 0;
+						gb->cgb.hdma_remaining = 0;
+						gb->hram_io[IO_HDMA5] = 0xFF;
+					}
+				}
+			}
+			return;
+
+		case 0x68:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.bg_palette_index = val & 0x3F;
+				gb->cgb.bg_palette_autoinc = (val & 0x80) ? 1 : 0;
+				gb->hram_io[IO_BCPS] = val;
+			}
+			return;
+
+		case 0x69:
+			if(gb->cgb.enabled)
+			{
+				uint8_t idx = gb->cgb.bg_palette_index & 0x3F;
+				gb->cgb.bg_palette_data[idx] = val;
+				gb_cgb_update_palette_entry(gb, idx, 0);
+				if(gb->cgb.bg_palette_autoinc)
+					gb->cgb.bg_palette_index = (idx + 1) & 0x3F;
+				gb->hram_io[IO_BCPS] = (gb->cgb.bg_palette_index & 0x3F) | (gb->cgb.bg_palette_autoinc ? 0x80 : 0x00);
+				gb->hram_io[IO_BCPD] = val;
+			}
+			return;
+
+		case 0x6A:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.obj_palette_index = val & 0x3F;
+				gb->cgb.obj_palette_autoinc = (val & 0x80) ? 1 : 0;
+				gb->hram_io[IO_OCPS] = val;
+			}
+			return;
+
+		case 0x6B:
+			if(gb->cgb.enabled)
+			{
+				uint8_t idx = gb->cgb.obj_palette_index & 0x3F;
+				gb->cgb.obj_palette_data[idx] = val;
+				gb_cgb_update_palette_entry(gb, idx, 1);
+				if(gb->cgb.obj_palette_autoinc)
+					gb->cgb.obj_palette_index = (idx + 1) & 0x3F;
+				gb->hram_io[IO_OCPS] = (gb->cgb.obj_palette_index & 0x3F) | (gb->cgb.obj_palette_autoinc ? 0x80 : 0x00);
+				gb->hram_io[IO_OCPD] = val;
+			}
+			return;
+
+		case 0x70:
+			if(gb->cgb.enabled)
+			{
+				gb->cgb.wram_bank = val & 0x07;
+				gb->hram_io[IO_SVBK] = 0xF8 | (val & 0x07);
+			}
 			return;
 
 		/* Turn off boot ROM */
@@ -1443,8 +1993,8 @@ struct sprite_data {
 	uint8_t x;
 };
 
-#if PEANUT_GB_HIGH_LCD_ACCURACY
-static int compare_sprites(const struct sprite_data *const sd1, const struct sprite_data *const sd2)
+
+static inline int compare_sprites_typed(const struct sprite_data *const sd1, const struct sprite_data *const sd2)
 {
 	int x_res;
 
@@ -1454,11 +2004,25 @@ static int compare_sprites(const struct sprite_data *const sd1, const struct spr
 
 	return (int)sd1->sprite_number - (int)sd2->sprite_number;
 }
-#endif
 
-void __gb_draw_line(struct gb_s *gb)
+static int compare_sprites(const void *a, const void *b)
+{
+	const struct sprite_data *sd1 = (const struct sprite_data *)a;
+	const struct sprite_data *sd2 = (const struct sprite_data *)b;
+	return compare_sprites_typed(sd1, sd2);
+}
+
+
+PEANUT_GB_HOT_ATTR void __gb_draw_line(struct gb_s *gb)
 {
 	uint8_t pixels[160] = {0};
+	const uint8_t cgb_mode = gb->cgb.enabled;
+
+	if(cgb_mode)
+	{
+		memset(gb->display.cgb_bg_priority, 0, sizeof(gb->display.cgb_bg_priority));
+		memset(gb->display.cgb_bg_color_zero, 0, sizeof(gb->display.cgb_bg_color_zero));
+	}
 
 	/* If LCD not initialised by front-end, don't render anything. */
 	if(gb->display.lcd_draw_line == NULL)
@@ -1486,6 +2050,8 @@ void __gb_draw_line(struct gb_s *gb)
 		}
 	}
 
+	if(!cgb_mode)
+	{
 	/* If background is enabled, draw it. */
 	if(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE)
 	{
@@ -1657,29 +2223,32 @@ void __gb_draw_line(struct gb_s *gb)
 			uint8_t OX = gb->oam[4 * sprite_number + 1];
 
 			/* If sprite isn't on this line, continue. */
-			if (gb->hram_io[IO_LY] +
-				(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY
+			if(gb->hram_io[IO_LY] +
+					(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY
 					|| gb->hram_io[IO_LY] + 16 < OY)
 				continue;
 
-			struct sprite_data current;
-
-			current.sprite_number = sprite_number;
-			current.x = OX;
+			struct sprite_data current = {
+				.sprite_number = sprite_number,
+				.x = OX
+			};
 
 			uint8_t place;
-			for (place = number_of_sprites; place != 0; place--)
+			for(place = number_of_sprites; place != 0; place--)
 			{
-				if(compare_sprites(&sprites_to_render[place - 1], &current) < 0)
+				if(compare_sprites_typed(&sprites_to_render[place - 1], &current) < 0)
 					break;
 			}
+
 			if(place >= MAX_SPRITES_LINE)
 				continue;
-			for (uint8_t i = number_of_sprites; i > place; --i) {
-				sprites_to_render[i] = sprites_to_render[i - 1];
-			}
+
 			if(number_of_sprites < MAX_SPRITES_LINE)
 				number_of_sprites++;
+
+			for(uint8_t i = number_of_sprites - 1; i > place; --i)
+				sprites_to_render[i] = sprites_to_render[i - 1];
+
 			sprites_to_render[place] = current;
 		}
 #endif
@@ -1779,17 +2348,194 @@ void __gb_draw_line(struct gb_s *gb)
 	}
 
 	gb->display.lcd_draw_line(gb, pixels, gb->hram_io[IO_LY]);
+	return;
+	}
+
+	uint8_t line = gb->hram_io[IO_LY];
+	uint8_t lcdc = gb->hram_io[IO_LCDC];
+
+	/* In CGB mode, LCDC_BG_ENABLE controls priority, not rendering.
+	 * Background always renders, but when disabled, BG/Window lose
+	 * priority over sprites. */
+	uint16_t bg_map_base = (lcdc & LCDC_BG_MAP) ? VRAM_BMAP_2 : VRAM_BMAP_1;
+	uint16_t bg_y = (uint16_t)line + gb->hram_io[IO_SCY];
+	uint16_t row_index = ((bg_y & 0x00FF) >> 3) * 32;
+
+	for(uint_fast16_t x = 0; x < LCD_WIDTH; x++)
+	{
+		uint16_t bg_x = ((uint16_t)gb->hram_io[IO_SCX] + x) & 0x00FF;
+		uint16_t column_index = (bg_x >> 3) & 0x1F;
+		uint16_t map_index = (row_index + column_index) & 0x03FF;
+		uint8_t tile_idx = gb->vram[bg_map_base + map_index];
+		uint8_t attr = gb->vram[VRAM_SIZE + bg_map_base + map_index];
+		uint8_t palette_index = attr & 0x07;
+		uint8_t vram_bank = (attr & 0x08) ? 1 : 0;
+		uint8_t tile_y = bg_y & 0x07;
+		if(attr & 0x40)
+			tile_y = 7 - tile_y;
+		uint16_t tile_addr;
+		if(lcdc & LCDC_TILE_SELECT)
+			tile_addr = VRAM_TILES_1 + tile_idx * 0x10;
+		else
+			tile_addr = VRAM_TILES_2 + ((int8_t)tile_idx + 128) * 0x10;
+		tile_addr += tile_y * 2;
+		uint16_t bank_offset = vram_bank * VRAM_SIZE;
+		uint8_t low = gb->vram[bank_offset + tile_addr];
+		uint8_t high = gb->vram[bank_offset + tile_addr + 1];
+		uint8_t bit_index = (attr & 0x20) ? (bg_x & 0x07) : (uint8_t)(7 - (bg_x & 0x07));
+		uint8_t colour_idx = ((low >> bit_index) & 0x01) | (((high >> bit_index) & 0x01) << 1);
+		gb->display.cgb_line[x] = gb->display.cgb_bg_palette[palette_index * 4 + colour_idx];
+		gb->display.cgb_bg_color_zero[x] = (colour_idx == 0);
+		gb->display.cgb_bg_priority[x] = (attr & 0x80) ? 1 : 0;
+		pixels[x] = colour_idx;
+	}
+
+	if((lcdc & LCDC_WINDOW_ENABLE) && line >= gb->display.WY && gb->hram_io[IO_WX] <= 166)
+	{
+		uint16_t window_map_base = (lcdc & LCDC_WINDOW_MAP) ? VRAM_BMAP_2 : VRAM_BMAP_1;
+		uint16_t window_line = gb->display.window_clear;
+		uint16_t window_row = ((window_line & 0x00FF) >> 3) * 32;
+		uint16_t window_x_start = (gb->hram_io[IO_WX] <= 7) ? 0 : (uint16_t)(gb->hram_io[IO_WX] - 7);
+		if(window_x_start < LCD_WIDTH)
+		{
+			for(uint_fast16_t x = window_x_start; x < LCD_WIDTH; x++)
+			{
+				uint16_t window_x = x - window_x_start;
+				uint16_t column_index = (window_x >> 3) & 0x1F;
+				uint16_t map_index = (window_row + column_index) & 0x03FF;
+				uint8_t tile_idx = gb->vram[window_map_base + map_index];
+				uint8_t attr = gb->vram[VRAM_SIZE + window_map_base + map_index];
+				uint8_t palette_index = attr & 0x07;
+				uint8_t vram_bank = (attr & 0x08) ? 1 : 0;
+				uint8_t tile_y = window_line & 0x07;
+				if(attr & 0x40)
+					tile_y = 7 - tile_y;
+				uint16_t tile_addr;
+				if(lcdc & LCDC_TILE_SELECT)
+					tile_addr = VRAM_TILES_1 + tile_idx * 0x10;
+				else
+					tile_addr = VRAM_TILES_2 + ((int8_t)tile_idx + 128) * 0x10;
+				tile_addr += tile_y * 2;
+				uint16_t bank_offset = vram_bank * VRAM_SIZE;
+				uint8_t low = gb->vram[bank_offset + tile_addr];
+				uint8_t high = gb->vram[bank_offset + tile_addr + 1];
+				uint8_t bit_index = (attr & 0x20) ? (window_x & 0x07) : (uint8_t)(7 - (window_x & 0x07));
+				uint8_t colour_idx = ((low >> bit_index) & 0x01) | (((high >> bit_index) & 0x01) << 1);
+				gb->display.cgb_line[x] = gb->display.cgb_bg_palette[palette_index * 4 + colour_idx];
+				gb->display.cgb_bg_color_zero[x] = (colour_idx == 0);
+				gb->display.cgb_bg_priority[x] = (attr & 0x80) ? 1 : 0;
+				pixels[x] = colour_idx;
+			}
+		}
+		gb->display.window_clear++;
+	}
+
+	if(lcdc & LCDC_OBJ_ENABLE)
+	{
+		uint8_t sprite_number;
+#if PEANUT_GB_HIGH_LCD_ACCURACY
+		uint8_t number_of_sprites = 0;
+		struct sprite_data sprites_to_render[MAX_SPRITES_LINE];
+
+		/* In CGB mode, sprite priority is determined by OAM order (lower OAM index = higher priority).
+		 * The hardware scans OAM sequentially and stops after finding MAX_SPRITES_LINE sprites on the line.
+		 * We must preserve OAM order, not sort by X coordinate. */
+		for(sprite_number = 0; sprite_number < NUM_SPRITES && number_of_sprites < MAX_SPRITES_LINE; sprite_number++)
+		{
+			uint8_t OY = gb->oam[4 * sprite_number + 0];
+			uint8_t OX = gb->oam[4 * sprite_number + 1];
+			if(line + (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY || line + 16 < OY)
+				continue;
+			if(OX == 0 || OX >= 168)
+				continue;
+			sprites_to_render[number_of_sprites].sprite_number = sprite_number;
+			sprites_to_render[number_of_sprites].x = OX;
+			number_of_sprites++;
+		}
+#endif
+
+#if PEANUT_GB_HIGH_LCD_ACCURACY
+		for(sprite_number = number_of_sprites - 1; sprite_number != 0xFF; sprite_number--)
+		{
+			uint8_t s = sprites_to_render[sprite_number].sprite_number;
+#else
+		for(sprite_number = NUM_SPRITES - 1; sprite_number != 0xFF; sprite_number--)
+		{
+			uint8_t s = sprite_number;
+#endif
+			uint8_t OY = gb->oam[4 * s + 0];
+			uint8_t OX = gb->oam[4 * s + 1];
+			uint8_t OT = gb->oam[4 * s + 2] & (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0xFE : 0xFF);
+			uint8_t OF = gb->oam[4 * s + 3];
+
+			if(OX == 0 || OX >= 168)
+				continue;
+
+			uint8_t py = line - OY + 16;
+			if(OF & OBJ_FLIP_Y)
+				py = (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 15 : 7) - py;
+
+			uint8_t palette_index = OF & 0x07;
+			uint8_t vram_bank = (OF & 0x08) ? 1 : 0;
+			uint16_t bank_offset = vram_bank * VRAM_SIZE;
+			uint16_t tile_addr = VRAM_TILES_1 + OT * 0x10 + 2 * py;
+			uint8_t t1 = gb->vram[bank_offset + tile_addr];
+			uint8_t t2 = gb->vram[bank_offset + tile_addr + 1];
+
+			uint8_t dir, start, end, shift;
+			if(OF & OBJ_FLIP_X)
+			{
+				dir = 1;
+				start = (OX < 8 ? 0 : OX - 8);
+				end = MIN(OX, LCD_WIDTH);
+				shift = 8 - OX + start;
+			}
+			else
+			{
+				dir = (uint8_t)-1;
+				start = MIN(OX, LCD_WIDTH) - 1;
+				end = (OX < 8 ? 0 : OX - 8) - 1;
+				shift = OX - (start + 1);
+			}
+
+			t1 >>= shift;
+			t2 >>= shift;
+
+			for(uint8_t disp_x = start; disp_x != end; disp_x += dir)
+			{
+				uint8_t colour_idx = (t1 & 0x1) | ((t2 & 0x1) << 1);
+				uint8_t bg_nonzero = !gb->display.cgb_bg_color_zero[disp_x];
+				/* In CGB mode, when LCDC_BG_ENABLE is off, BG/Window lose all priority.
+				 * Sprites draw over everything except their own color 0. */
+				uint8_t bg_has_priority = (lcdc & LCDC_BG_ENABLE) && 
+				                          (((OF & OBJ_PRIORITY) && bg_nonzero) || 
+				                           (gb->display.cgb_bg_priority[disp_x] && bg_nonzero));
+				if(colour_idx && !bg_has_priority)
+				{
+					gb->display.cgb_line[disp_x] = gb->display.cgb_obj_palette[palette_index * 4 + colour_idx];
+					pixels[disp_x] = colour_idx;
+				}
+				t1 >>= 1;
+				t2 >>= 1;
+			}
+		}
+	}
+
+	gb->display.lcd_draw_line(gb, pixels, line);
+	return;
 }
 #endif
 
 /**
  * Internal function used to step the CPU.
  */
-void __gb_step_cpu(struct gb_s *gb)
+PEANUT_GB_HOT_ATTR void __gb_step_cpu(struct gb_s *gb)
 {
 	uint8_t opcode;
+	uint16_t current_pc;
 	uint_fast16_t inst_cycles;
-	static const uint8_t op_cycles[0x100] =
+ 	uint8_t * const io = gb->hram_io;
+	static const uint8_t PEANUT_GB_FAST_DATA_ATTR op_cycles[0x100] =
 	{
 		/* *INDENT-OFF* */
 		/*0 1 2  3  4  5  6  7  8  9  A  B  C  D  E  F	*/
@@ -1811,59 +2557,81 @@ void __gb_step_cpu(struct gb_s *gb)
 		12,12,8, 4, 0,16, 8,16,12, 8,16, 4, 0, 0, 8,16	/* 0xF0 */
 		/* *INDENT-ON* */
 	};
-	static const uint_fast16_t TAC_CYCLES[4] = {1024, 16, 64, 256};
+	static const uint_fast16_t PEANUT_GB_FAST_DATA_ATTR TAC_CYCLES[4] = {1024, 16, 64, 256};
 
-	/* Handle interrupts */
-	/* If gb_halt is positive, then an interrupt must have occurred by the
-	 * time we reach here, because on HALT, we jump to the next interrupt
-	 * immediately. */
-	while(gb->gb_halt || (gb->gb_ime &&
-			gb->hram_io[IO_IF] & gb->hram_io[IO_IE] & ANY_INTR))
+	/* Handle interrupts and HALT behavior. */
+	const uint8_t pending_intr = io[IO_IF] & ANY_INTR;
+	const uint8_t enabled_intr = pending_intr & io[IO_IE];
+
+	if(PEANUT_GB_UNLIKELY(gb->gb_halt))
 	{
-		gb->gb_halt = false;
 
-		if(!gb->gb_ime)
-			break;
+		if(PEANUT_GB_UNLIKELY(pending_intr == 0))
+		{
+			/* Remain in HALT until an interrupt is requested. Advance a tiny
+			 * amount of time so timers continue to progress. */
+			inst_cycles = 4;
+			goto peanut_update_timers;
+		}
 
-		/* Disable interrupts */
-		gb->gb_ime = false;
+		/* Wake the CPU from HALT. */
+		gb->gb_halt = 0;
 
+		/* HALT bug: resume execution without servicing masked interrupts. */
+		if(PEANUT_GB_UNLIKELY(enabled_intr == 0 || !gb->gb_ime))
+			goto peanut_fetch_opcode;
+	}
+	else if(PEANUT_GB_LIKELY(!(gb->gb_ime && enabled_intr)))
+	{
+		/* Common case: no interrupts to service, fall through to opcode fetch. */
+		goto peanut_fetch_opcode;
+	}
+
+
+	if(PEANUT_GB_UNLIKELY(gb->gb_ime && enabled_intr))
+	{
+		/* Disable interrupts while we service one. */
+		gb->gb_ime = 0;
 		/* Push Program Counter */
 		__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.p);
 		__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.c);
 
 		/* Call interrupt handler if required. */
-		if(gb->hram_io[IO_IF] & gb->hram_io[IO_IE] & VBLANK_INTR)
+		if(enabled_intr & VBLANK_INTR)
 		{
 			gb->cpu_reg.pc.reg = VBLANK_INTR_ADDR;
-			gb->hram_io[IO_IF] ^= VBLANK_INTR;
+			io[IO_IF] ^= VBLANK_INTR;
 		}
-		else if(gb->hram_io[IO_IF] & gb->hram_io[IO_IE] & LCDC_INTR)
+		else if(enabled_intr & LCDC_INTR)
 		{
 			gb->cpu_reg.pc.reg = LCDC_INTR_ADDR;
-			gb->hram_io[IO_IF] ^= LCDC_INTR;
+			io[IO_IF] ^= LCDC_INTR;
 		}
-		else if(gb->hram_io[IO_IF] & gb->hram_io[IO_IE] & TIMER_INTR)
+		else if(enabled_intr & TIMER_INTR)
 		{
 			gb->cpu_reg.pc.reg = TIMER_INTR_ADDR;
-			gb->hram_io[IO_IF] ^= TIMER_INTR;
+			io[IO_IF] ^= TIMER_INTR;
 		}
-		else if(gb->hram_io[IO_IF] & gb->hram_io[IO_IE] & SERIAL_INTR)
+		else if(enabled_intr & SERIAL_INTR)
 		{
 			gb->cpu_reg.pc.reg = SERIAL_INTR_ADDR;
-			gb->hram_io[IO_IF] ^= SERIAL_INTR;
+			io[IO_IF] ^= SERIAL_INTR;
 		}
-		else if(gb->hram_io[IO_IF] & gb->hram_io[IO_IE] & CONTROL_INTR)
+		else if(enabled_intr & CONTROL_INTR)
 		{
 			gb->cpu_reg.pc.reg = CONTROL_INTR_ADDR;
-			gb->hram_io[IO_IF] ^= CONTROL_INTR;
+			io[IO_IF] ^= CONTROL_INTR;
 		}
-
-		break;
 	}
 
+peanut_fetch_opcode:
 	/* Obtain opcode */
-	opcode = __gb_read(gb, gb->cpu_reg.pc.reg++);
+	current_pc = gb->cpu_reg.pc.reg;
+	opcode = __gb_read(gb, current_pc);
+	gb->cpu_reg.pc.reg = current_pc + 1;
+#if PEANUT_GB_ENABLE_TRACE
+	gb_trace_push(gb, current_pc, opcode);
+#endif
 	inst_cycles = op_cycles[opcode];
 
 	/* Execute opcode */
@@ -1953,8 +2721,29 @@ void __gb_step_cpu(struct gb_s *gb)
 		break;
 
 	case 0x10: /* STOP */
+	{
+		if(gb->cgb.enabled)
+		{
+			if(gb->cgb.key1 & 0x01)
+			{
+				gb->cgb.speed_double = gb->cgb.speed_double ? 0 : 1;
+				gb->cgb.key1 = 0;
+				gb->hram_io[IO_KEY1] = (gb->cgb.speed_double ? 0x80 : 0x00) | 0x7E;
+				gb->hram_io[IO_DIV] = 0;
+				gb->counter.div_count = 0;
+			}
+			else
+			{
+				gb->gb_halt = 1;
+			}
+		}
+		else
+		{
+			gb->gb_halt = 1;
+		}
 		//gb->gb_halt = true;
 		break;
+	}
 
 	case 0x11: /* LD DE, imm */
 		gb->cpu_reg.de.bytes.e = __gb_read(gb, gb->cpu_reg.pc.reg++);
@@ -2468,8 +3257,7 @@ void __gb_step_cpu(struct gb_s *gb)
 	case 0x76: /* HALT */
 	{
 		int_fast16_t halt_cycles = INT_FAST16_MAX;
-
-		/* TODO: Emulate HALT bug? */
+		gb->gb_halt = 1;
 		gb->gb_halt = true;
 
 		if(gb->hram_io[IO_SC] & SERIAL_SC_TX_START)
@@ -3270,10 +4058,19 @@ void __gb_step_cpu(struct gb_s *gb)
 		PGB_UNREACHABLE();
 	}
 
+peanut_update_timers:
 	do
 	{
+		uint_fast16_t cycles = inst_cycles;
+		uint_fast16_t timer_cycles = inst_cycles;
+		if(gb->cgb.enabled && gb->cgb.speed_double)
+		{
+			cycles = (cycles + 1u) >> 1;
+			if(cycles == 0)
+				cycles = 1;
+		}
 		/* DIV register timing */
-		gb->counter.div_count += inst_cycles;
+		gb->counter.div_count += timer_cycles;
 		while(gb->counter.div_count >= DIV_CYCLES)
 		{
 			gb->hram_io[IO_DIV]++;
@@ -3283,7 +4080,7 @@ void __gb_step_cpu(struct gb_s *gb)
 		/* Check for RTC tick. */
 		if(gb->mbc == 3 && (gb->rtc_real.reg.high & 0x40) == 0)
 		{
-			gb->counter.rtc_count += inst_cycles;
+			gb->counter.rtc_count += cycles;
 			while(PGB_UNLIKELY(gb->counter.rtc_count >= RTC_CYCLES))
 			{
 				gb->counter.rtc_count -= RTC_CYCLES;
@@ -3335,7 +4132,7 @@ void __gb_step_cpu(struct gb_s *gb)
 				gb->gb_serial_tx != NULL)
 				(gb->gb_serial_tx)(gb, gb->hram_io[IO_SB]);
 
-			gb->counter.serial_count += inst_cycles;
+			gb->counter.serial_count += timer_cycles;
 
 			/* If it's time to receive byte, call RX function. */
 			if(gb->counter.serial_count >= SERIAL_CYCLES)
@@ -3381,7 +4178,7 @@ void __gb_step_cpu(struct gb_s *gb)
 		/* TODO: Change tac_enable to struct of TAC timer control bits. */
 		if(gb->hram_io[IO_TAC] & IO_TAC_ENABLE_MASK)
 		{
-			gb->counter.tima_count += inst_cycles;
+			gb->counter.tima_count += timer_cycles;
 
 			while(gb->counter.tima_count >=
 				TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK])
@@ -3413,7 +4210,7 @@ void __gb_step_cpu(struct gb_s *gb)
 		}
 
 		/* LCD Timing */
-		gb->counter.lcd_count += inst_cycles;
+		gb->counter.lcd_count += cycles;
 
 		/* New Scanline. HBlank -> VBlank or OAM Scan */
 		if(gb->counter.lcd_count >= LCD_LINE_CYCLES)
@@ -3504,11 +4301,28 @@ void __gb_step_cpu(struct gb_s *gb)
 
 			if(gb->hram_io[IO_STAT] & STAT_MODE_0_INTR)
 				gb->hram_io[IO_IF] |= LCDC_INTR;
-
+			if(gb->cgb.enabled && gb->cgb.hdma_active && gb->hram_io[IO_LY] < LCD_HEIGHT)
+				gb_cgb_hblank_dma_step(gb);
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
 			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
 				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
 		}
+		/* Go from Mode 3 (LCD Draw) to Mode 0 (HBLANK). */
+		// else if(gb->cgb.enabled &&
+		// 	(gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW &&
+		// 	gb->counter.lcd_count >= LCD_MODE_0_CYCLES)
+		// {
+		// 	gb->hram_io[IO_STAT] =
+		// 		(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_HBLANK;
+
+		// 	if(gb->hram_io[IO_STAT] & STAT_MODE_0_INTR)
+		// 		gb->hram_io[IO_IF] |= LCDC_INTR;
+
+		// 	/* If halted immediately jump to next LCD mode. */
+		// 	if (gb->counter.lcd_count < LCD_LINE_CYCLES)
+		// 		inst_cycles = LCD_LINE_CYCLES - gb->counter.lcd_count;
+		// }
+		/* Update LCD */
 		/* Go from Mode 2 (OAM Scan) to Mode 3 (LCD Draw). */
 		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_OAM_SCAN &&
 				gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
@@ -3526,7 +4340,7 @@ void __gb_step_cpu(struct gb_s *gb)
 	/* If halted, loop until an interrupt occurs. */
 }
 
-void gb_run_frame(struct gb_s *gb)
+PEANUT_GB_HOT_ATTR void gb_run_frame(struct gb_s *gb)
 {
 	gb->gb_frame = false;
 
@@ -3613,6 +4427,30 @@ uint8_t gb_colour_hash(struct gb_s *gb)
  */
 void gb_reset(struct gb_s *gb)
 {
+	gb->gb_halt = 0;
+	gb->gb_ime = 1;
+	gb->trace.head = 0;
+	gb->trace.count = 0;
+
+	gb->cgb.vram_bank = 0;
+	gb->cgb.wram_bank = 1;
+	gb->cgb.key1 = 0;
+	gb->cgb.speed_double = 0;
+	gb->cgb.bg_palette_index = 0;
+	gb->cgb.obj_palette_index = 0;
+	gb->cgb.bg_palette_autoinc = 0;
+	gb->cgb.obj_palette_autoinc = 0;
+	gb->cgb.hdma_active = 0;
+	gb->cgb.hdma_source = 0;
+	gb->cgb.hdma_dest = 0x8000;
+	gb->cgb.hdma_remaining = 0;
+	memset(gb->cgb.bg_palette_data, 0x00, sizeof(gb->cgb.bg_palette_data));
+	memset(gb->cgb.obj_palette_data, 0x00, sizeof(gb->cgb.obj_palette_data));
+	memset(gb->display.cgb_bg_palette, 0x00, sizeof(gb->display.cgb_bg_palette));
+	memset(gb->display.cgb_obj_palette, 0x00, sizeof(gb->display.cgb_obj_palette));
+	memset(gb->display.cgb_line, 0x00, sizeof(gb->display.cgb_line));
+	memset(gb->display.cgb_bg_priority, 0x00, sizeof(gb->display.cgb_bg_priority));
+	memset(gb->display.cgb_bg_color_zero, 0x00, sizeof(gb->display.cgb_bg_color_zero));
 	gb->gb_halt = false;
 	gb->gb_ime = true;
 
@@ -3622,23 +4460,48 @@ void gb_reset(struct gb_s *gb)
 	gb->enable_cart_ram = 0;
 	gb->cart_mode_select = 0;
 
+	if(gb->mbc == 7)
+		mbc7_init(&gb->mbc7);
+
 	/* Use values as though the boot ROM was already executed. */
 	if(gb->gb_bootrom_read == NULL)
 	{
 		uint8_t hdr_chk;
 		hdr_chk = gb->gb_rom_read(gb, ROM_HEADER_CHECKSUM_LOC) != 0;
 
-		gb->cpu_reg.a = 0x01;
-		gb->cpu_reg.f.f_bits.z = 1;
-		gb->cpu_reg.f.f_bits.n = 0;
-		gb->cpu_reg.f.f_bits.h = hdr_chk;
-		gb->cpu_reg.f.f_bits.c = hdr_chk;
-		gb->cpu_reg.bc.reg = 0x0013;
-		gb->cpu_reg.de.reg = 0x00D8;
-		gb->cpu_reg.hl.reg = 0x014D;
-		gb->cpu_reg.sp.reg = 0xFFFE;
-		gb->cpu_reg.pc.reg = 0x0100;
+		if(gb->cgb.enabled)
+		{
+			gb->cpu_reg.a = 0x11;
+			gb->cpu_reg.f.reg = 0x80;
+			gb->cpu_reg.bc.reg = 0x0000;
+			gb->cpu_reg.de.reg = 0xFF56;
+			gb->cpu_reg.hl.reg = 0x000D;
+			gb->cpu_reg.sp.reg = 0xFFFE;
+			gb->cpu_reg.pc.reg = 0x0100;
 
+			gb->hram_io[IO_DIV ] = 0x00;
+			gb->hram_io[IO_LCDC] = 0x91;
+			gb->hram_io[IO_STAT] = 0x85;
+			gb->hram_io[IO_BANK] = 0x01;
+		}
+		else
+		{
+			gb->cpu_reg.a = 0x01;
+			gb->cpu_reg.f.f_bits.z = 1;
+			gb->cpu_reg.f.f_bits.n = 0;
+			gb->cpu_reg.f.f_bits.h = hdr_chk;
+			gb->cpu_reg.f.f_bits.c = hdr_chk;
+			gb->cpu_reg.bc.reg = 0x0013;
+			gb->cpu_reg.de.reg = 0x00D8;
+			gb->cpu_reg.hl.reg = 0x014D;
+			gb->cpu_reg.sp.reg = 0xFFFE;
+			gb->cpu_reg.pc.reg = 0x0100;
+
+			gb->hram_io[IO_DIV ] = 0xAB;
+			gb->hram_io[IO_LCDC] = 0x91;
+			gb->hram_io[IO_STAT] = 0x85;
+			gb->hram_io[IO_BANK] = 0x01;
+		}
 		gb->hram_io[IO_DIV ] = 0xAB;
 		gb->hram_io[IO_LCDC] = 0x91;
 		gb->hram_io[IO_STAT] = 0x85;
@@ -3646,7 +4509,7 @@ void gb_reset(struct gb_s *gb)
 
 		__gb_write(gb, 0xFF26, 0xF1);
 
-		memset(gb->vram, 0x00, VRAM_SIZE);
+		memset(gb->vram, 0x00, VRAM_TOTAL_SIZE);
 	}
 	else
 	{
@@ -3665,6 +4528,8 @@ void gb_reset(struct gb_s *gb)
 	gb->counter.serial_count = 0;
 	gb->counter.rtc_count = 0;
 	gb->counter.lcd_off_count = 0;
+
+	memset(gb->wram, 0x00, WRAM_TOTAL_SIZE);
 
 	gb->direct.joypad = 0xFF;
 	gb->hram_io[IO_JOYP] = 0xCF;
@@ -3689,6 +4554,47 @@ void gb_reset(struct gb_s *gb)
 	gb->hram_io[IO_WX] = 0x00;
 	gb->hram_io[IO_IE] = 0x00;
 	gb->hram_io[IO_IF] = 0xE1;
+
+	if(gb->cgb.enabled)
+	{
+		gb->hram_io[IO_KEY1] = 0x7E;
+		gb->hram_io[IO_VBK] = 0xFE;
+		gb->hram_io[IO_SVBK] = 0xF8 | (gb->cgb.wram_bank & 0x07);
+		gb->hram_io[IO_BCPS] = 0x00;
+		gb->hram_io[IO_BCPD] = 0x00;
+		gb->hram_io[IO_OCPS] = 0x00;
+		gb->hram_io[IO_OCPD] = 0x00;
+		gb->hram_io[IO_HDMA1] = 0x00;
+		gb->hram_io[IO_HDMA2] = 0x00;
+		gb->hram_io[IO_HDMA3] = 0x00;
+		gb->hram_io[IO_HDMA4] = 0x00;
+		gb->hram_io[IO_HDMA5] = 0xFF;
+
+		// CGB games always start in normal speed mode.
+		// They switch to double-speed via STOP instruction (opcode 0x10) when needed.
+		// speed_double is already initialized to 0 in gb_init_cpu().
+	}
+	else
+	{
+		gb->hram_io[IO_KEY1] = 0xFF;
+		gb->hram_io[IO_VBK] = 0xFF;
+		gb->hram_io[IO_SVBK] = 0xFF;
+		gb->hram_io[IO_BCPS] = 0xFF;
+		gb->hram_io[IO_BCPD] = 0xFF;
+		gb->hram_io[IO_OCPS] = 0xFF;
+		gb->hram_io[IO_OCPD] = 0xFF;
+		gb->hram_io[IO_HDMA1] = 0xFF;
+		gb->hram_io[IO_HDMA2] = 0xFF;
+		gb->hram_io[IO_HDMA3] = 0xFF;
+		gb->hram_io[IO_HDMA4] = 0xFF;
+		gb->hram_io[IO_HDMA5] = 0xFF;
+	}
+}
+
+void gb_set_cgb_mode(struct gb_s *gb, uint8_t enable)
+{
+	gb->cgb.enabled = enable ? 1 : 0;
+	gb_reset(gb);
 }
 
 enum gb_init_error_e gb_init(struct gb_s *gb,
@@ -3705,7 +4611,6 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
 	 * Table for cartridge type (MBC). -1 if invalid.
 	 * TODO: MMM01 is untested.
 	 * TODO: MBC6 is untested.
-	 * TODO: MBC7 is unsupported.
 	 * TODO: POCKET CAMERA is unsupported.
 	 * TODO: BANDAI TAMA5 is unsupported.
 	 * TODO: HuC3 is unsupported.
@@ -3714,13 +4619,15 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
 	const int8_t cart_mbc[] =
 	{
 		0, 1, 1, 1, -1, 2, 2, -1, 0, 0, -1, 0, 0, 0, -1, 3,
-		3, 3, 3, 3, -1, -1, -1, -1, -1, 5, 5, 5, 5, 5, 5, -1
+		3, 3, 3, 3, -1, -1, -1, -1, -1, 5, 5, 5, 5, 5, 5, -1,
+		-1, 7, 7
 	};
 	/* Whether cart has RAM. */
 	const uint8_t cart_ram[] =
 	{
 		0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0,
-		1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0
+		1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
+		0, 1, 1
 	};
 	/* How large the ROM is in banks of 16 KiB. */
 	const uint16_t num_rom_banks_mask[] =
@@ -3736,12 +4643,48 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
 	gb->gb_cart_ram_write = gb_cart_ram_write;
 	gb->gb_error = gb_error;
 	gb->direct.priv = priv;
+	gb->cgb.enabled = 0;
+
+	uint8_t allocated_wram = 0;
+	uint8_t allocated_vram = 0;
+	uint8_t allocated_oam = 0;
+	uint8_t allocated_hram = 0;
+
+	if(gb->wram == NULL)
+	{
+		gb->wram = (uint8_t *)calloc(WRAM_TOTAL_SIZE, sizeof(uint8_t));
+		if(gb->wram == NULL)
+			goto alloc_fail;
+		allocated_wram = 1;
+	}
+	if(gb->vram == NULL)
+	{
+		gb->vram = (uint8_t *)calloc(VRAM_TOTAL_SIZE, sizeof(uint8_t));
+		if(gb->vram == NULL)
+			goto alloc_fail;
+		allocated_vram = 1;
+	}
+	if(gb->oam == NULL)
+	{
+		gb->oam = (uint8_t *)calloc(OAM_SIZE, sizeof(uint8_t));
+		if(gb->oam == NULL)
+			goto alloc_fail;
+		allocated_oam = 1;
+	}
+	if(gb->hram_io == NULL)
+	{
+		gb->hram_io = (uint8_t *)calloc(HRAM_IO_SIZE, sizeof(uint8_t));
+		if(gb->hram_io == NULL)
+			goto alloc_fail;
+		allocated_hram = 1;
+	}
 
 	/* Initialise serial transfer function to NULL. If the front-end does
 	 * not provide serial support, Peanut-GB will emulate no cable connected
 	 * automatically. */
 	gb->gb_serial_tx = NULL;
 	gb->gb_serial_rx = NULL;
+	gb->mbc7_accel_read = NULL;
 
 	gb->gb_bootrom_read = NULL;
 
@@ -3793,6 +4736,29 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
 	gb_reset(gb);
 
 	return GB_INIT_NO_ERROR;
+
+alloc_fail:
+	if(allocated_wram)
+	{
+		free(gb->wram);
+		gb->wram = NULL;
+	}
+	if(allocated_vram)
+	{
+		free(gb->vram);
+		gb->vram = NULL;
+	}
+	if(allocated_oam)
+	{
+		free(gb->oam);
+		gb->oam = NULL;
+	}
+	if(allocated_hram)
+	{
+		free(gb->hram_io);
+		gb->hram_io = NULL;
+	}
+	return GB_INIT_OUT_OF_MEMORY;
 }
 
 const char* gb_get_rom_name(struct gb_s* gb, char *title_str)
@@ -3827,6 +4793,17 @@ void gb_init_lcd(struct gb_s *gb,
 {
 	gb->display.lcd_draw_line = lcd_draw_line;
 
+	gb->direct.interlace = 0;
+	gb->display.interlace_count = 0;
+	gb->direct.frame_skip = 0;
+	gb->display.frame_skip_count = 0;
+	gb->display.frame_skip_state.hold_frames = 6;
+	gb->display.frame_skip_state.minimum_active_frames = 24;
+	gb->display.frame_skip_state.debounce_frames_remaining = 0;
+	gb->display.frame_skip_state.frames_since_toggle = 0;
+	gb->display.frame_skip_state.over_budget_streak = 0;
+	gb->display.frame_skip_state.under_budget_streak = 0;
+	gb->display.frame_skip_state.current_frame_skip = 0;
 	gb->direct.interlace = false;
 	gb->display.interlace_count = false;
 	gb->direct.frame_skip = false;
@@ -3897,7 +4874,7 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
  *
  * \param	An initialised emulator context. Must not be NULL.
  */
-void gb_run_frame(struct gb_s *gb);
+PEANUT_GB_HOT_ATTR void gb_run_frame(struct gb_s *gb);
 
 /**
  * Internal function used to step the CPU. Used mainly for testing.
@@ -3905,7 +4882,7 @@ void gb_run_frame(struct gb_s *gb);
  *
  * \param	An initialised emulator context. Must not be NULL.
  */
-void __gb_step_cpu(struct gb_s *gb);
+PEANUT_GB_HOT_ATTR void __gb_step_cpu(struct gb_s *gb);
 
 /** Function prototypes: Optional Functions **/
 /**
@@ -3915,6 +4892,7 @@ void __gb_step_cpu(struct gb_s *gb);
  * \param	An initialised emulator context. Must not be NULL.
  */
 void gb_reset(struct gb_s *gb);
+void gb_set_cgb_mode(struct gb_s *gb, uint8_t enable);
 
 /**
  * Initialises the display context of the emulator. Only available when
