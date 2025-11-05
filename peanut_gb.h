@@ -107,6 +107,7 @@ enum mbc7_eeprom_state_e
 #define MBC7_EEPROM_MATCH_WRAL	0x040
 
 #define MBC7_ACCEL_CENTER	0x81D0
+#define MBC7_ACCEL_UNLATCHED	0x8000
 #define MBC7_ACCEL_GRAVITY_EFFECT	0x70
 
 typedef int (*mbc7_accel_read_t)(struct gb_s *gb, float *x_out, float *y_out);
@@ -949,8 +950,8 @@ void mbc7_init(struct mbc7_s *mbc7)
 {
 	memset(mbc7, 0, sizeof(*mbc7));
 
-	mbc7->accel.x = MBC7_ACCEL_CENTER;
-	mbc7->accel.y = MBC7_ACCEL_CENTER;
+	mbc7->accel.x = MBC7_ACCEL_UNLATCHED;
+	mbc7->accel.y = MBC7_ACCEL_UNLATCHED;
 	mbc7->accel.latched = 0;
 
 	mbc7_eeprom_reset(&mbc7->eeprom);
@@ -1003,6 +1004,7 @@ static void mbc7_eeprom_process_command(struct mbc7_eeprom_s *eeprom)
 			eeprom->address = addr;
 			eeprom->state = MBC7_EEPROM_WRITE;
 			eeprom->bit_count = 0;
+			eeprom->do_out = 0;
 		}
 		break;
 
@@ -1013,6 +1015,7 @@ static void mbc7_eeprom_process_command(struct mbc7_eeprom_s *eeprom)
 			eeprom->data[addr] = 0xFFFF;
 			eeprom->busy = 1;
 			eeprom->state = MBC7_EEPROM_WAIT_READY;
+			eeprom->do_out = 0;
 		}
 		break;
 
@@ -1039,6 +1042,7 @@ static void mbc7_eeprom_process_command(struct mbc7_eeprom_s *eeprom)
 
 				eeprom->busy = 1;
 				eeprom->state = MBC7_EEPROM_WAIT_READY;
+				eeprom->do_out = 0;
 			}
 		}
 		else if(pattern == MBC7_EEPROM_MATCH_WRAL)
@@ -1048,6 +1052,7 @@ static void mbc7_eeprom_process_command(struct mbc7_eeprom_s *eeprom)
 				eeprom->state = MBC7_EEPROM_WRITE;
 				eeprom->bit_count = 0;
 				eeprom->address = 0xFF;
+				eeprom->do_out = 0;
 			}
 		}
 		break;
@@ -1184,14 +1189,7 @@ void mbc7_accel_latch(struct mbc7_s *mbc7,
 
 uint8_t mbc7_eeprom_poll_do(struct mbc7_eeprom_s *eeprom)
 {
-	if(eeprom->busy)
-	{
-		eeprom->busy = 0;
-		eeprom->state = MBC7_EEPROM_IDLE;
-	}
-
-	eeprom->do_out = 1;
-	return 1;
+	return eeprom->do_out;
 }
 
 #define IO_JOYP	0x00
@@ -1735,14 +1733,14 @@ PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t 
 				uint8_t reg = (addr >> 4) & 0x0F;
 				switch(reg)
 				{
-				case 0x0:
-					if(val == 0x55)
-					{
-						gb->mbc7.accel.latched = 0;
-						gb->mbc7.accel.x = MBC7_ACCEL_CENTER;
-						gb->mbc7.accel.y = MBC7_ACCEL_CENTER;
-					}
-					break;
+			case 0x0:
+				if(val == 0x55)
+				{
+					gb->mbc7.accel.latched = 0;
+					gb->mbc7.accel.x = MBC7_ACCEL_UNLATCHED;
+					gb->mbc7.accel.y = MBC7_ACCEL_UNLATCHED;
+				}
+				break;
 				case 0x1:
 					if(val == 0xAA && !gb->mbc7.accel.latched)
 					{
