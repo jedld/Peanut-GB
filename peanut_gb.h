@@ -51,7 +51,78 @@
 #include <esp_attr.h>
 #endif
 
-#include "../mbc7.h"
+/* Forward declaration for emulator context. */
+struct gb_s;
+
+/** MBC7 support types and helpers. */
+struct mbc7_accel_s
+{
+	uint16_t x;
+	uint16_t y;
+	uint8_t latched;
+};
+
+struct mbc7_eeprom_s
+{
+	uint16_t data[128];
+
+	uint8_t cs;
+	uint8_t clk;
+	uint8_t di;
+	uint8_t do_out;
+
+	uint8_t state;
+	uint16_t shift_reg;
+	uint8_t bit_count;
+	uint8_t address;
+	uint8_t write_enabled;
+	uint8_t busy;
+};
+
+struct mbc7_s
+{
+	struct mbc7_accel_s accel;
+	struct mbc7_eeprom_s eeprom;
+	uint8_t ram_enable_1;
+	uint8_t ram_enable_2;
+};
+
+enum mbc7_eeprom_state_e
+{
+	MBC7_EEPROM_IDLE = 0,
+	MBC7_EEPROM_COMMAND,
+	MBC7_EEPROM_READ,
+	MBC7_EEPROM_WRITE,
+	MBC7_EEPROM_WAIT_READY
+};
+
+#define MBC7_EEPROM_CMD_READ	0x02
+#define MBC7_EEPROM_CMD_MISC	0x00
+#define MBC7_EEPROM_CMD_WRITE	0x01
+#define MBC7_EEPROM_CMD_ERASE	0x03
+
+#define MBC7_EEPROM_MATCH_EWEN	0x0C0
+#define MBC7_EEPROM_MATCH_EWDS	0x000
+#define MBC7_EEPROM_MATCH_ERAL	0x080
+#define MBC7_EEPROM_MATCH_WRAL	0x040
+
+#define MBC7_ACCEL_CENTER	0x81D0
+#define MBC7_ACCEL_GRAVITY_EFFECT	0x70
+
+typedef int (*mbc7_accel_read_t)(struct gb_s *gb, float *x_out, float *y_out);
+
+void mbc7_init(struct mbc7_s *mbc7);
+void mbc7_eeprom_reset(struct mbc7_eeprom_s *eeprom);
+void mbc7_eeprom_update(struct mbc7_eeprom_s *eeprom, uint8_t value);
+void mbc7_accel_latch(struct mbc7_s *mbc7, mbc7_accel_read_t read_callback,
+	struct gb_s *gb);
+uint8_t mbc7_eeprom_poll_do(struct mbc7_eeprom_s *eeprom);
+
+static inline uint16_t mbc7_accel_float_to_value(float accel)
+{
+	int16_t offset = (int16_t)(accel * (float)MBC7_ACCEL_GRAVITY_EFFECT);
+	return (uint16_t)((int16_t)MBC7_ACCEL_CENTER + offset);
+}
 
 /**
 * If PEANUT_GB_IS_LITTLE_ENDIAN is positive, then Peanut-GB will be configured
@@ -111,6 +182,11 @@
 # define PEANUT_GB_USE_INTRINSICS 1
 #endif
 
+/* Enable Game Boy Color (CGB) support. Define to 0 for DMG-only builds. */
+#ifndef PEANUT_GB_SUPPORTS_CGB
+# define PEANUT_GB_SUPPORTS_CGB 1
+#endif
+
 /* Hint hot paths to land in IRAM on ESP32-family targets. */
 #if !defined(PEANUT_GB_HOT_ATTR)
 # if defined(ESP_PLATFORM)
@@ -162,9 +238,14 @@
 
 /* Memory section sizes for DMG */
 #define WRAM_SIZE	0x2000
-#define WRAM_TOTAL_SIZE	(WRAM_BANK_SIZE * 8)
 #define VRAM_SIZE	0x2000
-#define VRAM_TOTAL_SIZE	(VRAM_SIZE * 2)
+#if PEANUT_GB_SUPPORTS_CGB
+# define WRAM_TOTAL_SIZE	(WRAM_BANK_SIZE * 8)
+# define VRAM_TOTAL_SIZE	(VRAM_SIZE * 2)
+#else
+# define WRAM_TOTAL_SIZE	WRAM_SIZE
+# define VRAM_TOTAL_SIZE	VRAM_SIZE
+#endif
 #define HRAM_IO_SIZE	0x0100
 #define OAM_SIZE	0x00A0
 
@@ -862,6 +943,257 @@ struct gb_s
 
 #ifndef PEANUT_GB_HEADER_ONLY
 
+static void mbc7_eeprom_process_command(struct mbc7_eeprom_s *eeprom);
+
+void mbc7_init(struct mbc7_s *mbc7)
+{
+	memset(mbc7, 0, sizeof(*mbc7));
+
+	mbc7->accel.x = MBC7_ACCEL_CENTER;
+	mbc7->accel.y = MBC7_ACCEL_CENTER;
+	mbc7->accel.latched = 0;
+
+	mbc7_eeprom_reset(&mbc7->eeprom);
+
+	mbc7->ram_enable_1 = 0;
+	mbc7->ram_enable_2 = 0;
+}
+
+void mbc7_eeprom_reset(struct mbc7_eeprom_s *eeprom)
+{
+	for(uint_fast16_t i = 0; i < PEANUT_GB_ARRAYSIZE(eeprom->data); i++)
+		eeprom->data[i] = 0xFFFF;
+
+	eeprom->cs = 0;
+	eeprom->clk = 0;
+	eeprom->di = 0;
+	eeprom->do_out = 1;
+
+	eeprom->state = MBC7_EEPROM_IDLE;
+	eeprom->shift_reg = 0;
+	eeprom->bit_count = 0;
+	eeprom->address = 0;
+	eeprom->write_enabled = 0;
+	eeprom->busy = 0;
+}
+
+static void mbc7_eeprom_process_command(struct mbc7_eeprom_s *eeprom)
+{
+	const uint16_t cmd = eeprom->shift_reg;
+	const uint8_t opcode = (uint8_t)((cmd >> 7) & 0x03);
+	const uint8_t addr = (uint8_t)(cmd & 0x7F);
+
+	switch(opcode)
+	{
+	case MBC7_EEPROM_CMD_READ:
+		if(addr < PEANUT_GB_ARRAYSIZE(eeprom->data))
+		{
+			eeprom->address = addr;
+			eeprom->shift_reg = eeprom->data[addr];
+			eeprom->bit_count = 17;
+			eeprom->state = MBC7_EEPROM_READ;
+			eeprom->do_out = 0;
+		}
+		break;
+
+	case MBC7_EEPROM_CMD_WRITE:
+		if(eeprom->write_enabled &&
+		   addr < PEANUT_GB_ARRAYSIZE(eeprom->data))
+		{
+			eeprom->address = addr;
+			eeprom->state = MBC7_EEPROM_WRITE;
+			eeprom->bit_count = 0;
+		}
+		break;
+
+	case MBC7_EEPROM_CMD_ERASE:
+		if(eeprom->write_enabled &&
+		   addr < PEANUT_GB_ARRAYSIZE(eeprom->data))
+		{
+			eeprom->data[addr] = 0xFFFF;
+			eeprom->busy = 1;
+			eeprom->state = MBC7_EEPROM_WAIT_READY;
+		}
+		break;
+
+	case MBC7_EEPROM_CMD_MISC:
+	{
+		const uint16_t pattern = cmd & 0x1FFu;
+
+		if(pattern == MBC7_EEPROM_MATCH_EWEN)
+		{
+			eeprom->write_enabled = 1;
+		}
+		else if(pattern == MBC7_EEPROM_MATCH_EWDS)
+		{
+			eeprom->write_enabled = 0;
+		}
+		else if(pattern == MBC7_EEPROM_MATCH_ERAL)
+		{
+			if(eeprom->write_enabled)
+			{
+				for(uint_fast16_t i = 0;
+				    i < PEANUT_GB_ARRAYSIZE(eeprom->data);
+				    i++)
+					eeprom->data[i] = 0xFFFF;
+
+				eeprom->busy = 1;
+				eeprom->state = MBC7_EEPROM_WAIT_READY;
+			}
+		}
+		else if(pattern == MBC7_EEPROM_MATCH_WRAL)
+		{
+			if(eeprom->write_enabled)
+			{
+				eeprom->state = MBC7_EEPROM_WRITE;
+				eeprom->bit_count = 0;
+				eeprom->address = 0xFF;
+			}
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+}
+
+void mbc7_eeprom_update(struct mbc7_eeprom_s *eeprom, uint8_t value)
+{
+	uint8_t new_cs = (uint8_t)((value >> 7) & 0x01);
+	uint8_t new_clk = (uint8_t)((value >> 6) & 0x01);
+	uint8_t new_di = (uint8_t)((value >> 1) & 0x01);
+
+	if(new_cs && !eeprom->cs)
+	{
+		eeprom->state = MBC7_EEPROM_COMMAND;
+		eeprom->shift_reg = 0;
+		eeprom->bit_count = 0;
+		eeprom->do_out = 0;
+	}
+
+	if(!new_cs && eeprom->cs)
+	{
+		eeprom->state = MBC7_EEPROM_IDLE;
+		eeprom->bit_count = 0;
+	}
+
+	if(new_cs && new_clk && !eeprom->clk)
+	{
+		switch(eeprom->state)
+		{
+		case MBC7_EEPROM_COMMAND:
+			eeprom->shift_reg = (uint16_t)((eeprom->shift_reg << 1) | new_di);
+			eeprom->bit_count++;
+
+			if(eeprom->bit_count >= 10)
+				mbc7_eeprom_process_command(eeprom);
+			break;
+
+		case MBC7_EEPROM_READ:
+			if(eeprom->bit_count == 17)
+			{
+				eeprom->do_out = 0;
+				eeprom->bit_count--;
+			}
+			else if(eeprom->bit_count > 0)
+			{
+				eeprom->do_out = (uint8_t)((eeprom->shift_reg >> 15) & 0x01);
+				eeprom->shift_reg <<= 1;
+				eeprom->bit_count--;
+
+				if(eeprom->bit_count == 0 && eeprom->cs)
+				{
+					eeprom->address = (uint8_t)((eeprom->address + 1) & 0x7F);
+					eeprom->shift_reg = eeprom->data[eeprom->address];
+					eeprom->bit_count = 16;
+				}
+			}
+			else
+			{
+				eeprom->state = MBC7_EEPROM_IDLE;
+			}
+			break;
+
+		case MBC7_EEPROM_WRITE:
+			eeprom->shift_reg = (uint16_t)((eeprom->shift_reg << 1) | new_di);
+			eeprom->bit_count++;
+
+			if(eeprom->bit_count >= 16)
+			{
+				if(eeprom->address == 0xFF)
+				{
+					for(uint_fast16_t i = 0;
+					    i < PEANUT_GB_ARRAYSIZE(eeprom->data);
+					    i++)
+						eeprom->data[i] = eeprom->shift_reg;
+				}
+				else if(eeprom->address <
+					PEANUT_GB_ARRAYSIZE(eeprom->data))
+				{
+					eeprom->data[eeprom->address] = eeprom->shift_reg;
+				}
+
+				eeprom->busy = 1;
+				eeprom->state = MBC7_EEPROM_WAIT_READY;
+			}
+			break;
+
+		case MBC7_EEPROM_WAIT_READY:
+			eeprom->busy = 0;
+			eeprom->do_out = 1;
+			eeprom->state = MBC7_EEPROM_IDLE;
+			break;
+
+		default:
+			break;
+		}
+	}
+
+	eeprom->cs = new_cs;
+	eeprom->clk = new_clk;
+	eeprom->di = new_di;
+
+	if(eeprom->state == MBC7_EEPROM_IDLE && !eeprom->busy)
+		eeprom->do_out = 1;
+}
+
+void mbc7_accel_latch(struct mbc7_s *mbc7,
+	mbc7_accel_read_t read_callback,
+	struct gb_s *gb)
+{
+	if(read_callback != NULL)
+	{
+		float x = 0.0f;
+		float y = 0.0f;
+
+		if(read_callback(gb, &x, &y) != 0)
+		{
+			mbc7->accel.x = mbc7_accel_float_to_value(x);
+			mbc7->accel.y = mbc7_accel_float_to_value(y);
+			mbc7->accel.latched = 1;
+		}
+	}
+	else
+	{
+		mbc7->accel.x = MBC7_ACCEL_CENTER;
+		mbc7->accel.y = MBC7_ACCEL_CENTER;
+		mbc7->accel.latched = 1;
+	}
+}
+
+uint8_t mbc7_eeprom_poll_do(struct mbc7_eeprom_s *eeprom)
+{
+	if(eeprom->busy)
+	{
+		eeprom->busy = 0;
+		eeprom->state = MBC7_EEPROM_IDLE;
+	}
+
+	eeprom->do_out = 1;
+	return 1;
+}
+
 #define IO_JOYP	0x00
 #define IO_SB	0x01
 #define IO_SC	0x02
@@ -919,11 +1251,15 @@ static inline uint8_t *gb_wram_ptr(struct gb_s *gb, uint16_t addr)
 	if(addr < WRAM_1_ADDR)
 		return &gb->wram[addr - WRAM_0_ADDR];
 
+#if PEANUT_GB_SUPPORTS_CGB
 	uint8_t bank = gb->cgb.enabled ? (gb->cgb.wram_bank & 0x07) : 1;
 	if(bank == 0)
 		bank = 1;
 
 	return &gb->wram[bank * WRAM_BANK_SIZE + (addr - WRAM_1_ADDR)];
+#else
+	return &gb->wram[addr - WRAM_1_ADDR];
+#endif
 }
 
 static inline uint16_t gb_map_echo_address(uint16_t addr)
@@ -951,6 +1287,7 @@ static inline uint8_t gb_reverse_byte(uint8_t value)
 	return value;
 }
 
+#if PEANUT_GB_SUPPORTS_CGB
 static inline void gb_cgb_update_palette_entry(struct gb_s *gb, uint8_t index, uint8_t is_obj)
 {
 	const uint8_t entry = (index & 0x3E) >> 1;
@@ -1009,6 +1346,25 @@ static inline void gb_cgb_hblank_dma_step(struct gb_s *gb)
 		gb->hram_io[IO_HDMA5] = 0x80 | (blocks_remaining & 0x7F);
 	}
 }
+#else
+static inline void gb_cgb_update_palette_entry(struct gb_s *gb, uint8_t index, uint8_t is_obj)
+{
+	(void)gb;
+	(void)index;
+	(void)is_obj;
+}
+
+static inline void gb_cgb_dma_transfer_chunk(struct gb_s *gb, uint16_t length)
+{
+	(void)gb;
+	(void)length;
+}
+
+static inline void gb_cgb_hblank_dma_step(struct gb_s *gb)
+{
+	(void)gb;
+}
+#endif
 
 static inline void gb_trace_push(struct gb_s *gb, uint16_t pc, uint8_t opcode)
 {
@@ -1080,8 +1436,10 @@ PEANUT_GB_HOT_ATTR uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 	case 0x9:
 	{
 		uint16_t offset = addr - VRAM_ADDR;
+#if PEANUT_GB_SUPPORTS_CGB
 		if(gb->cgb.enabled)
 			return gb->vram[(gb->cgb.vram_bank & 0x01) * VRAM_SIZE + offset];
+#endif
 		return gb->vram[offset];
 	}
 
@@ -1190,6 +1548,7 @@ PEANUT_GB_HOT_ATTR uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 		if(addr >= IO_ADDR)
 		{
 			const uint16_t reg = addr - IO_ADDR;
+#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				switch(reg)
@@ -1222,6 +1581,7 @@ PEANUT_GB_HOT_ATTR uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 					break;
 				}
 			}
+#endif
 			return gb->hram_io[reg];
 		}
 	}
@@ -1355,10 +1715,14 @@ PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t 
 	case 0x9:
 	{
 		uint16_t offset = addr - VRAM_ADDR;
+		#if PEANUT_GB_SUPPORTS_CGB
 		if(gb->cgb.enabled)
+		{
 			gb->vram[(gb->cgb.vram_bank & 0x01) * VRAM_SIZE + offset] = val;
-		else
-			gb->vram[offset] = val;
+			return;
+		}
+		#endif
+		gb->vram[offset] = val;
 		return;
 	}
 
@@ -1638,54 +2002,67 @@ PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t 
 			return;
 
 		case 0x4D:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.key1 = val & 0x01;
 				gb->hram_io[IO_KEY1] = (gb->cgb.speed_double ? 0x80 : 0x00) | 0x7E | gb->cgb.key1;
 			}
+	#endif
 			return;
 
 		case 0x4F:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.vram_bank = val & 0x01;
 				gb->hram_io[IO_VBK] = 0xFE | gb->cgb.vram_bank;
 			}
+	#endif
 			return;
 
 		case 0x51:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.hdma_source = (gb->cgb.hdma_source & 0x00FF) | ((uint16_t)val << 8);
 				gb->hram_io[IO_HDMA1] = val;
 			}
+	#endif
 			return;
 
 		case 0x52:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.hdma_source = (gb->cgb.hdma_source & 0xFF00) | (val & 0xF0);
 				gb->hram_io[IO_HDMA2] = val & 0xF0;
 			}
+	#endif
 			return;
 
 		case 0x53:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.hdma_dest = 0x8000 | (((uint16_t)val & 0x1F) << 8) | (gb->cgb.hdma_dest & 0x00F0);
 				gb->hram_io[IO_HDMA3] = val;
 			}
+	#endif
 			return;
 
 		case 0x54:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.hdma_dest = (gb->cgb.hdma_dest & 0xFF00) | (val & 0xF0);
 				gb->hram_io[IO_HDMA4] = val & 0xF0;
 			}
+	#endif
 			return;
 
 		case 0x55:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				uint16_t length = (uint16_t)(((val & 0x7F) + 1u) * 0x10u);
@@ -1702,7 +2079,7 @@ PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t 
 							gb_cgb_hblank_dma_step(gb);
 					}
 					else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_HBLANK &&
-					        gb->hram_io[IO_LY] < LCD_HEIGHT)
+				        gb->hram_io[IO_LY] < LCD_HEIGHT)
 					{
 						gb_cgb_hblank_dma_step(gb);
 					}
@@ -1730,18 +2107,22 @@ PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t 
 					}
 				}
 			}
+	#endif
 			return;
 
 		case 0x68:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.bg_palette_index = val & 0x3F;
 				gb->cgb.bg_palette_autoinc = (val & 0x80) ? 1 : 0;
 				gb->hram_io[IO_BCPS] = val;
 			}
+	#endif
 			return;
 
 		case 0x69:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				uint8_t idx = gb->cgb.bg_palette_index & 0x3F;
@@ -1752,18 +2133,22 @@ PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t 
 				gb->hram_io[IO_BCPS] = (gb->cgb.bg_palette_index & 0x3F) | (gb->cgb.bg_palette_autoinc ? 0x80 : 0x00);
 				gb->hram_io[IO_BCPD] = val;
 			}
+	#endif
 			return;
 
 		case 0x6A:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.obj_palette_index = val & 0x3F;
 				gb->cgb.obj_palette_autoinc = (val & 0x80) ? 1 : 0;
 				gb->hram_io[IO_OCPS] = val;
 			}
+	#endif
 			return;
 
 		case 0x6B:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				uint8_t idx = gb->cgb.obj_palette_index & 0x3F;
@@ -1774,14 +2159,17 @@ PEANUT_GB_HOT_ATTR void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t 
 				gb->hram_io[IO_OCPS] = (gb->cgb.obj_palette_index & 0x3F) | (gb->cgb.obj_palette_autoinc ? 0x80 : 0x00);
 				gb->hram_io[IO_OCPD] = val;
 			}
+	#endif
 			return;
 
 		case 0x70:
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled)
 			{
 				gb->cgb.wram_bank = val & 0x07;
 				gb->hram_io[IO_SVBK] = 0xF8 | (val & 0x07);
 			}
+	#endif
 			return;
 
 		/* Turn off boot ROM */
@@ -2016,6 +2404,7 @@ static int compare_sprites(const void *a, const void *b)
 PEANUT_GB_HOT_ATTR void __gb_draw_line(struct gb_s *gb)
 {
 	uint8_t pixels[160] = {0};
+#if PEANUT_GB_SUPPORTS_CGB
 	const uint8_t cgb_mode = gb->cgb.enabled;
 
 	if(cgb_mode)
@@ -2023,6 +2412,7 @@ PEANUT_GB_HOT_ATTR void __gb_draw_line(struct gb_s *gb)
 		memset(gb->display.cgb_bg_priority, 0, sizeof(gb->display.cgb_bg_priority));
 		memset(gb->display.cgb_bg_color_zero, 0, sizeof(gb->display.cgb_bg_color_zero));
 	}
+#endif
 
 	/* If LCD not initialised by front-end, don't render anything. */
 	if(gb->display.lcd_draw_line == NULL)
@@ -2050,8 +2440,10 @@ PEANUT_GB_HOT_ATTR void __gb_draw_line(struct gb_s *gb)
 		}
 	}
 
+#if PEANUT_GB_SUPPORTS_CGB
 	if(!cgb_mode)
 	{
+#endif
 	/* If background is enabled, draw it. */
 	if(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE)
 	{
@@ -2349,6 +2741,7 @@ PEANUT_GB_HOT_ATTR void __gb_draw_line(struct gb_s *gb)
 
 	gb->display.lcd_draw_line(gb, pixels, gb->hram_io[IO_LY]);
 	return;
+#if PEANUT_GB_SUPPORTS_CGB
 	}
 
 	uint8_t line = gb->hram_io[IO_LY];
@@ -2523,6 +2916,7 @@ PEANUT_GB_HOT_ATTR void __gb_draw_line(struct gb_s *gb)
 
 	gb->display.lcd_draw_line(gb, pixels, line);
 	return;
+#endif
 }
 #endif
 
@@ -2722,6 +3116,7 @@ peanut_fetch_opcode:
 
 	case 0x10: /* STOP */
 	{
+#if PEANUT_GB_SUPPORTS_CGB
 		if(gb->cgb.enabled)
 		{
 			if(gb->cgb.key1 & 0x01)
@@ -2736,12 +3131,10 @@ peanut_fetch_opcode:
 			{
 				gb->gb_halt = 1;
 			}
+			break;
 		}
-		else
-		{
-			gb->gb_halt = 1;
-		}
-		//gb->gb_halt = true;
+#endif
+		gb->gb_halt = 1;
 		break;
 	}
 
@@ -4063,12 +4456,14 @@ peanut_update_timers:
 	{
 		uint_fast16_t cycles = inst_cycles;
 		uint_fast16_t timer_cycles = inst_cycles;
+	#if PEANUT_GB_SUPPORTS_CGB
 		if(gb->cgb.enabled && gb->cgb.speed_double)
 		{
 			cycles = (cycles + 1u) >> 1;
 			if(cycles == 0)
 				cycles = 1;
 		}
+	#endif
 		/* DIV register timing */
 		gb->counter.div_count += timer_cycles;
 		while(gb->counter.div_count >= DIV_CYCLES)
@@ -4301,8 +4696,10 @@ peanut_update_timers:
 
 			if(gb->hram_io[IO_STAT] & STAT_MODE_0_INTR)
 				gb->hram_io[IO_IF] |= LCDC_INTR;
+	#if PEANUT_GB_SUPPORTS_CGB
 			if(gb->cgb.enabled && gb->cgb.hdma_active && gb->hram_io[IO_LY] < LCD_HEIGHT)
 				gb_cgb_hblank_dma_step(gb);
+	#endif
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
 			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
 				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
@@ -4432,6 +4829,7 @@ void gb_reset(struct gb_s *gb)
 	gb->trace.head = 0;
 	gb->trace.count = 0;
 
+#if PEANUT_GB_SUPPORTS_CGB
 	gb->cgb.vram_bank = 0;
 	gb->cgb.wram_bank = 1;
 	gb->cgb.key1 = 0;
@@ -4451,6 +4849,7 @@ void gb_reset(struct gb_s *gb)
 	memset(gb->display.cgb_line, 0x00, sizeof(gb->display.cgb_line));
 	memset(gb->display.cgb_bg_priority, 0x00, sizeof(gb->display.cgb_bg_priority));
 	memset(gb->display.cgb_bg_color_zero, 0x00, sizeof(gb->display.cgb_bg_color_zero));
+#endif
 	gb->gb_halt = false;
 	gb->gb_ime = true;
 
@@ -4469,6 +4868,7 @@ void gb_reset(struct gb_s *gb)
 		uint8_t hdr_chk;
 		hdr_chk = gb->gb_rom_read(gb, ROM_HEADER_CHECKSUM_LOC) != 0;
 
+		#if PEANUT_GB_SUPPORTS_CGB
 		if(gb->cgb.enabled)
 		{
 			gb->cpu_reg.a = 0x11;
@@ -4485,6 +4885,7 @@ void gb_reset(struct gb_s *gb)
 			gb->hram_io[IO_BANK] = 0x01;
 		}
 		else
+		#endif
 		{
 			gb->cpu_reg.a = 0x01;
 			gb->cpu_reg.f.f_bits.z = 1;
@@ -4555,6 +4956,7 @@ void gb_reset(struct gb_s *gb)
 	gb->hram_io[IO_IE] = 0x00;
 	gb->hram_io[IO_IF] = 0xE1;
 
+	#if PEANUT_GB_SUPPORTS_CGB
 	if(gb->cgb.enabled)
 	{
 		gb->hram_io[IO_KEY1] = 0x7E;
@@ -4575,6 +4977,7 @@ void gb_reset(struct gb_s *gb)
 		// speed_double is already initialized to 0 in gb_init_cpu().
 	}
 	else
+	#endif
 	{
 		gb->hram_io[IO_KEY1] = 0xFF;
 		gb->hram_io[IO_VBK] = 0xFF;
@@ -4591,11 +4994,19 @@ void gb_reset(struct gb_s *gb)
 	}
 }
 
+#if PEANUT_GB_SUPPORTS_CGB
 void gb_set_cgb_mode(struct gb_s *gb, uint8_t enable)
 {
 	gb->cgb.enabled = enable ? 1 : 0;
 	gb_reset(gb);
 }
+#else
+void gb_set_cgb_mode(struct gb_s *gb, uint8_t enable)
+{
+	(void)enable;
+	gb_reset(gb);
+}
+#endif
 
 enum gb_init_error_e gb_init(struct gb_s *gb,
 			     uint8_t (*gb_rom_read)(struct gb_s*, const uint_fast32_t),
